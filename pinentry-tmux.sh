@@ -51,10 +51,25 @@ fi
 set -euo pipefail
 pid_pinentry_tmux=$$
 
-# If we're not running in a pane, call the original pinentry directly.
-if ! tmux display-message -p "#{client_name}" &>/dev/null; then
+# Use the original pinentry directly unless this request originated inside tmux.
+# gpg forwards PINENTRY_USER_DATA from the calling process into pinentry's
+# environment (available at startup, unlike ttyname/ttytype which only arrive
+# later over the Assuan protocol). Mark your tmux sessions by adding to tmux.conf:
+#     set-environment -g PINENTRY_USER_DATA tmux
+# The second test guards against the marker being set with no reachable tmux
+# server (fall back to the direct pinentry rather than a doomed popup).
+if [[ "${PINENTRY_USER_DATA:-}" != *tmux* ]] || ! tmux display-message -p "#{client_name}" &>/dev/null; then
 	"$PINENTRY_TMUX_PROGRAM" "$@"
 	exit $?
+fi
+
+# From here on tmux is active and we go through the popup, which is a terminal
+# UI. The default `pinentry` may resolve to a GUI program (useless in a popup),
+# so prefer pinentry-curses when it is available. Exported so it is forwarded
+# into the popup by the env capture below; if pinentry-curses is not installed,
+# leave the discovered default in place. The non-tmux path above is unchanged.
+if _pinentry_curses="$(command -v pinentry-curses)"; then
+	export PINENTRY_TMUX_PROGRAM="$_pinentry_curses"
 fi
 
 # Make a pair of FIFOs to communicate with the popup.
