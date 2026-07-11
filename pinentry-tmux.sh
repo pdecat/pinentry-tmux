@@ -166,6 +166,7 @@ exec 3>"$PINENTRY_TMUX_STDOUT"
 while IFS='' read -r line; do
 	case "$line" in
 		"OPTION ttyname="*) printf "OK\n"; continue ;;
+		"OPTION ttytype="*) printf "OK\n"; continue ;;
 		"GETINFO flavor"*) printf "D pinentry-tmux\nOK\n"; continue ;;
 		*) printf "%s\n" "$line" 1>&3 ;;
 	esac
