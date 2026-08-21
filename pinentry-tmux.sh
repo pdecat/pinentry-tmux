@@ -56,9 +56,14 @@ pid_pinentry_tmux=$$
 # environment (available at startup, unlike ttyname/ttytype which only arrive
 # later over the Assuan protocol). Mark your tmux sessions by adding to tmux.conf:
 #     set-environment -g PINENTRY_USER_DATA tmux
-# The second test guards against the marker being set with no reachable tmux
-# server (fall back to the direct pinentry rather than a doomed popup).
-if [[ "${PINENTRY_USER_DATA:-}" != *tmux* ]] || ! tmux display-message -p "#{client_name}" &>/dev/null; then
+# The second test requires an attached client, which is what display-popup
+# actually needs: a reachable server is not enough. A client-less server still
+# expands #{client_name} to the empty string and exits 0, so testing
+# reachability alone let a request that arrives while nothing is attached (a
+# session restore relaunching ssh panes before the client attaches, for
+# instance) take the popup branch and hang on a popup tmux refuses to create.
+# Fall back to the direct pinentry rather than a doomed popup.
+if [[ "${PINENTRY_USER_DATA:-}" != *tmux* ]] || [[ -z "$(tmux list-clients -F "#{client_name}" 2>/dev/null)" ]]; then
 	"$PINENTRY_TMUX_PROGRAM" "$@"
 	exit $?
 fi
@@ -90,7 +95,7 @@ rkill() {
 	} \
 	| sed $'1d; s/[ \t]//g' \
 	| grep -Fv "$1" \
-	| xargs kill -INT \
+	| xargs --no-run-if-empty kill -TERM \
 	|| true
 }
 
@@ -101,7 +106,12 @@ cleanup() {
 	if [ -d "$fifodir" ]; then rmdir "$fifodir"; fi
 
 	if [ -n "${pid_popup:-}" ]   && kill -0 "$pid_popup" &>/dev/null; then tmux display-popup -C; fi
-	if [ -n "${pid_in_sock:-}" ] && kill -0 "$pid_in_sock" &>/dev/null; then kill -INT "$pid_in_sock"; fi
+	# SIGTERM, not SIGINT: with job control off, bash makes an asynchronous
+	# child ignore SIGINT, so the backgrounded reader would survive this script
+	# and keep the inherited protocol pipe open. gpg-agent would then still be
+	# waiting on a prompt that no longer exists, which is the hang this whole
+	# teardown exists to prevent.
+	if [ -n "${pid_in_sock:-}" ] && kill -0 "$pid_in_sock" &>/dev/null; then kill -TERM "$pid_in_sock"; fi
 
 	echo "BYE"
 }
@@ -132,18 +142,30 @@ pid_in_sock=$!
 	DESIRED_WIDTH=78
 	DESIRED_HEIGHT=18
 	read -r ACTUAL_WIDTH ACTUAL_HEIGHT \
-		< <(tmux display-message -p '#{client_width} #{client_height}')
+		< <(tmux display-message -p '#{client_width} #{client_height}') || true
 
-	if [[ "$ACTUAL_WIDTH" -lt "$DESIRED_WIDTH" ]]; then
+	# Shrink only to a size tmux actually reported. Both formats expand to the
+	# empty string when no client is attached, and an empty operand counts as 0
+	# in an arithmetic test, so an unguarded comparison would hand
+	# display-popup an empty -w and make it fail.
+	if [[ "$ACTUAL_WIDTH" =~ ^[0-9]+$ ]] && [[ "$ACTUAL_WIDTH" -lt "$DESIRED_WIDTH" ]]; then
 		DESIRED_WIDTH="$ACTUAL_WIDTH"
 	fi
 
-	if [[ "$ACTUAL_HEIGHT" -lt "$DESIRED_HEIGHT" ]]; then
+	if [[ "$ACTUAL_HEIGHT" =~ ^[0-9]+$ ]] && [[ "$ACTUAL_HEIGHT" -lt "$DESIRED_HEIGHT" ]]; then
 		DESIRED_HEIGHT="$ACTUAL_HEIGHT"
 	fi
 	
-	# Create the popup.
-	tmux display-popup -E \
+	# Create the popup. Anything other than a clean exit here means the prompt
+	# is not on screen, or no longer is: tmux refuses to create the popup when
+	# no client is attached or an overlay already owns the client, and a popup
+	# dismissed with `display-popup -C` takes the real pinentry down with it
+	# (status 129). gpg-agent runs one pinentry at a time, so a wrapper left
+	# waiting on the FIFO rendezvous below holds that slot and silently starves
+	# every later prompt until it is killed by hand. Tell the main process to
+	# abort instead. Only stdout is discarded for the subshell, so tmux's reason
+	# reaches stderr (the journal, under a systemd-managed gpg-agent).
+	if ! tmux display-popup -E \
 		-d "$(pwd)" \
 		"${envs[@]}" \
 		-e "PINENTRY_TMUX_CALLER=$pid_pinentry_tmux" \
@@ -155,9 +177,11 @@ pid_in_sock=$!
 		-B \
 		-w "$DESIRED_WIDTH" \
 		-h "$DESIRED_HEIGHT" \
-		"$0" || true
+		"$0"; then
+		kill -USR1 "$pid_pinentry_tmux" 2>/dev/null || true
+	fi
 
-}) 0>&- &>/dev/null &
+}) 0>&- >/dev/null &
 pid_popup=$!
 
 # Write STDOUT from pinentry-tmux to the socket STDIN.
